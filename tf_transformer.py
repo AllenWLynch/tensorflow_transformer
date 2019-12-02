@@ -41,11 +41,14 @@ class MultiHeadProjection(tf.keras.layers.Layer):
         self.m, self.k, self.model_dim = input_shape
         
         self.W = self.add_weight(
+                name = 'W',
                 shape = (self.h, self.model_dim, self.projected_dim), 
                 initializer = 'glorot_normal', 
                 trainable = True)
         
-        self.b = self.add_weight(shape = (self.h, 1, self.projected_dim), initializer = 'Zeros', 
+        self.b = self.add_weight(
+                name = 'b',
+                shape = (self.h, 1, self.projected_dim), initializer = 'Zeros', 
                 trainable = True)
         
     def call(self, X):
@@ -209,12 +212,14 @@ class TransformerDecoder(tf.keras.layers.Layer):
 
 class PositionalEmbedding(tf.keras.layers.Layer):
     
-    def __init__(self, **kwargs):
+    def __init__(self, max_seq_len = 1000, **kwargs):
         super().__init__(**kwargs)
+        self.max_seq_len = max_seq_len
     
     def build(self, input_shape):
         
         (self.m, self.k, self.d_model) = input_shape
+        self.k = self.max_seq_len
         
         pos = np.arange(self.k).reshape(-1,1)
         
@@ -233,7 +238,10 @@ class PositionalEmbedding(tf.keras.layers.Layer):
         self.embeddings = tf.convert_to_tensor(np.expand_dims(embeddings, 0), dtype = 'float32')
         
     def call(self, X):
-        X = X + self.embeddings
+
+        Tx = X.get_shape()[1]
+        
+        X = X + self.embeddings[:, :Tx, :]
         
         return tf.multiply(X, self.d_model**0.5)
 
@@ -253,6 +261,7 @@ class EncoderStack(tf.keras.layers.Layer):
     def build(self, input_shape):
 
         self.embedding = tf.keras.layers.Embedding(self.num_classes, self.d_model, mask_zero = True)
+        
         self.positional_embedding = PositionalEmbedding()
 
         self.embedding_dropout = tf.keras.layers.Dropout(self.dropout)
@@ -301,12 +310,8 @@ class DecoderStack(tf.keras.layers.Layer):
         assert(len(input_shape) == 3), 'Expected input with len 3 in the form of (decoder_input, encoder_output, encoder_mask)'
         #assert(input_shape[0][1] == input_shape[1][1]), 'Expected encoder output and decoder input to have same time dimension'
         
-        (_, k) = input_shape[0]
+        #(_, k) = input_shape[0]
         
-        num_ones = 0.5 * (k**2 + k)
-
-        self.trailing_mask = tfp.math.fill_triangular(tf.ones(num_ones), upper = False)
-
         self.embedding = tf.keras.layers.Embedding(self.num_classes, self.d_model, mask_zero = True)
         
         self.embedding_dropout = tf.keras.layers.Dropout(self.dropout)
@@ -321,16 +326,21 @@ class DecoderStack(tf.keras.layers.Layer):
     def call(self, inputs, training = True):
         
         (seqs, encoder_output, encoder_mask) = inputs
-        
-        X = self.embedding(seqs)
+
+        (_, k) = seqs.shape
+
+        num_ones = 0.5 * (k**2 + k)
+
+        trailing_mask = tfp.math.fill_triangular(tf.ones(num_ones), upper = False)
         
         loss_mask = self.embedding.compute_mask(seqs)
         #expand the mask from the embedding layer from (m, Tx) to (m, 1, 1, Tx) for multihead softmax
         decoder_padding_mask = tf.dtypes.cast(loss_mask, 'float32')[:, tf.newaxis, tf.newaxis, :]
         #then add trailing mask to it
-        decoder_mask = tf.multiply(decoder_padding_mask, self.trailing_mask)
+        decoder_mask = tf.multiply(decoder_padding_mask, trailing_mask)
         
         #print(decoder_mask)
+        X = self.embedding(seqs)
         
         X = self.positional_embedding(X)
 
@@ -352,12 +362,12 @@ class DecoderStack(tf.keras.layers.Layer):
 
 class TransformerModel(tf.keras.Model):
 
-    def __init__(self, num_classes, max_seq_len, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
+    def __init__(self, num_encoder_classes, num_decoder_classes, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
         super().__init__()
 
-        self.encoder_stack = EncoderStack(num_classes, d_model, num_layers, num_heads, dropout, dff)
+        self.encoder_stack = EncoderStack(num_encoder_classes, d_model, num_layers, num_heads, dropout, dff)
 
-        self.decoder_stack = DecoderStack(num_classes, d_model, num_layers, num_heads, dropout, dff)
+        self.decoder_stack = DecoderStack(num_decoder_classes, d_model, num_layers, num_heads, dropout, dff)
 
     def call(self, X, Y, training):
 
@@ -413,30 +423,57 @@ def TransformerOptimizer(d_model):
 
 class Transformer():
 
-    def __init(self, num_classes, max_seq_len, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
+    def __init__(self, num_encoder_classes, num_decoder_classes, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
 
-        self.model = TransformerModel(num_classes, max_seq_len, d_model, num_layers, num_heads, dropout, dff)
+        self.model = TransformerModel(num_encoder_classes, num_decoder_classes, d_model, num_layers, num_heads, dropout, dff)
 
         self.loss = TransformerLoss()
 
         self.opt = TransformerOptimizer(d_model)
 
 
-    def train_step(self, X,Y):
+    def train_step(self, X,Y, train = True):
 
         decoder_input = Y[:,:-1] # don't include end token pushed into decoder
         decoder_target = Y[:,1:] # don't include start token in decoder output label
 
         with tf.GradientTape() as tape:
 
-            predictions, mask = self.model((X,decoder_input), True)
+            predictions, mask = self.model(X, decoder_input, training = train)
 
-            loss = self.loss(predictions, decoder_target, mask)
+            loss = self.loss(decoder_target, predictions, mask)
 
         gradients = tape.gradient(loss, self.model.trainable_variables)    
         self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
 
-        return loss
+        return loss.numpy()
+
+
+    def fit_on_tfds(self, dataset, exp_loss_beta = 0.9, train = True):
+
+        batch_losses = []
+        epoch_loss = 0
+        update_print = ''
+
+        for (batch_num, (batch_x, batch_y)) in enumerate(dataset):
+
+            batch_loss = self.train_step(batch_x, batch_y, train = train)
+        
+            if train:
+                epoch_loss = (exp_loss_beta * epoch_loss + (1 - exp_loss_beta) * batch_loss)/(1 - exp_loss_beta**(batch_num + 1))
+                update_print = '\tBatch ' + str(batch_num + 1) + ', Loss: {0:.5f}'.format(epoch_loss)
+                print(update_print, end='\r')
+
+            batch_losses.append(batch_loss)
+
+        print(update_print)
+
+        if train:
+            return epoch_loss
+        else:
+            return np.mean(batch_losses)
+
+
 
     def train_in_batches(self, X, Y, batch_size, exp_loss_beta = 0.9, EMA = True):
 
@@ -500,6 +537,7 @@ class Transformer():
 
         return epoch_losses
 
+
     def infer(self, X, Y):
 
         assert(len(X.shape) == 2 and len(Y.shape == 2)), 'X and Y must both be rank 2 matrices: (m, Tx) where each entry is lookup index for embedding layer'
@@ -512,3 +550,5 @@ class Transformer():
         probabilities = tf.nn.softmax(predictions, axis = -1)
 
         return probabilities
+
+print('Loading Transformer Module')
