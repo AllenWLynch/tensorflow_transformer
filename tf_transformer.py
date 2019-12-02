@@ -73,7 +73,7 @@ class AttentionLayer(tf.keras.layers.Layer):
         (self.projQ, self.projK, self.projV) = (MultiHeadProjection(self.projected_dim, self.h) 
                                        for input_ in input_shape)
         
-        (output_m, output_k, output_d) = input_shape[-1]
+        output_d = input_shape[-1][-1]
         
         self.reshaper = tf.keras.layers.Reshape(target_shape = (-1, self.projected_dim * self.h))
         
@@ -442,7 +442,7 @@ class Transformer():
 
         m = X.shape[0]
         
-        num_batches = math.ceil(m / batch_size)
+        num_batches = np.ceil(m / batch_size)
 
         losses = []
 
@@ -450,8 +450,8 @@ class Transformer():
         
         for (batch_num, step) in enumerate(range(0, m, batch_size)):
 
-                batch_x = X[step : min(step + batch_size, m)]
-                batch_y = Y[step : min(step + batch_size, m)]
+                batch_x = X[step : np.min(step + batch_size, m)]
+                batch_y = Y[step : np.min(step + batch_size, m)]
 
                 batch_loss = self.train_step(batch_x, batch_y)
 
@@ -468,7 +468,7 @@ class Transformer():
 
         if validation_split > 0:
             m = X.shape[0]
-            validation_m = math.floor(validation_split * m)
+            validation_m = (validation_split * m)//1
             m -= validation_m
 
             trainX, trainY, validationX, validationY = X[:m], Y[:m], X[m:], Y[m:]
@@ -499,3 +499,16 @@ class Transformer():
             pass
 
         return epoch_losses
+
+    def infer(self, X, Y):
+
+        assert(len(X.shape) == 2 and len(Y.shape == 2)), 'X and Y must both be rank 2 matrices: (m, Tx) where each entry is lookup index for embedding layer'
+        assert(X.shape[0] == 0), 'Batch size must be 1 for inference'
+
+        infer_Tx = np.count_nonzero(Y)
+
+        predictions = self.model((X,Y), training = False)[0,infer_Tx] # returns rank 1 array of num_classes
+
+        probabilities = tf.nn.softmax(predictions, axis = -1)
+
+        return probabilities
