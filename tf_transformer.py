@@ -270,7 +270,9 @@ class EncoderStack(tf.keras.layers.Layer):
         
         X = self.positional_embedding(X)
 
-        X = self.embedding_dropout(X)
+        X = self.embedding_dropout(X, training = training)
+        
+        X = X * self.d_model**0.5
         
         #call(self, X, encoder_output, lookahead_mask = None, encoder_padding_mask = None, training = True)
         for encoder in self.encoders:
@@ -296,7 +298,7 @@ class DecoderStack(tf.keras.layers.Layer):
     def build(self, input_shape):
         
         assert(len(input_shape) == 3), 'Expected input with len 3 in the form of (decoder_input, encoder_output, encoder_mask)'
-        assert(input_shape[0][1] == input_shape[1][1]), 'Expected encoder output and decoder input to have same time dimension'
+        #assert(input_shape[0][1] == input_shape[1][1]), 'Expected encoder output and decoder input to have same time dimension'
         
         (_, k) = input_shape[0]
         
@@ -305,7 +307,7 @@ class DecoderStack(tf.keras.layers.Layer):
         self.trailing_mask = tfp.math.fill_triangular(tf.ones(num_ones), upper = False)
 
         self.embedding = tf.keras.layers.Embedding(self.num_classes, self.d_model, mask_zero = True)
-
+        
         self.embedding_dropout = tf.keras.layers.Dropout(self.dropout)
         
         self.positional_embedding = PositionalEmbedding()
@@ -321,8 +323,9 @@ class DecoderStack(tf.keras.layers.Layer):
         
         X = self.embedding(seqs)
         
+        loss_mask = self.embedding.compute_mask(seqs)
         #expand the mask from the embedding layer from (m, Tx) to (m, 1, 1, Tx) for multihead softmax
-        decoder_padding_mask = tf.dtypes.cast(self.embedding.compute_mask(seqs), 'float32')[:, tf.newaxis, tf.newaxis, :]
+        decoder_padding_mask = tf.dtypes.cast(loss_mask, 'float32')[:, tf.newaxis, tf.newaxis, :]
         #then add trailing mask to it
         decoder_mask = tf.multiply(decoder_padding_mask, self.trailing_mask)
         
@@ -330,7 +333,9 @@ class DecoderStack(tf.keras.layers.Layer):
         
         X = self.positional_embedding(X)
 
-        X = self.embedding_dropout(X)
+        X = self.embedding_dropout(X, training = training)
+
+        X = X * self.d_model**0.5
         
         #call(self, X, encoder_output, lookahead_mask = None, encoder_padding_mask = None, training = True)
         for decoder in self.decoders:
@@ -339,48 +344,43 @@ class DecoderStack(tf.keras.layers.Layer):
             
         X = tf.matmul(X, tf.transpose(self.embedding.embeddings))
             
-        return X
+        return X, loss_mask
         
 
 # # Transformer Model
 
-def Transformer(num_classes, max_seq_len, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
-        
-        X = tf.keras.Input(shape = (max_seq_len,))
-        
-        Y = tf.keras.Input(shape = (max_seq_len,))
-        
-        enc_output, encoder_mask = EncoderStack(num_classes, d_model, num_layers, num_heads, dropout, dff)(X)
-    
-        logits = DecoderStack(num_classes, d_model, num_layers, num_heads, dropout, dff)((Y, enc_output, encoder_mask))
-        
-        return tf.keras.Model(inputs = [X,Y], outputs = [logits])
+class TransformerModel(tf.keras.Model):
 
-# # Loss Function
+    def __init__(self, num_classes, max_seq_len, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
+        super().__init__()
+
+        self.encoder_stack = EncoderStack(num_classes, d_model, num_layers, num_heads, dropout, dff)
+
+        self.decoder_stack = DecoderStack(num_classes, d_model, num_layers, num_heads, dropout, dff)
+
+    def call(self, X, Y, training):
+
+            enc_output, encoder_mask = self.encoder_stack(X, training = training)
+        
+            logits, mask = self.decoder_stack((Y, enc_output, encoder_mask), training = training)
+
+            return logits, mask
+        
 
 class TransformerLoss():
-    
-    '''
-    logits: output from linear dense layer (m, Tx, num_classes)
-    y_true: labels for sparse crossentropy (m, Tx)
-    epsilon: label smoothing factor [0,1]
-    returns loss value
-    '''
-    
-    def __init__(self, epsilon = 0.):
-        self.epsilon = epsilon
-    
+
+    def __init__(self):
+        
+        self.loss_obj = tf.keras.losses.SparseCategoricalCrossentropy(
+                        from_logits=True, reduction='none')
+
     def __call__(self, labels, logits):
-    
-        (m, Tx, num_classes) = logits.get_shape()
 
-        expanded_y = tf.keras.utils.to_categorical(labels, num_classes = num_classes) #shape = (m, Tx, num_classes)
+        losses = self.loss_object(labels, logits)
 
-        losses = tf.keras.losses.categorical_crossentropy(expanded_y, logits, from_logits=True, label_smoothing = self.epsilon)
+        mean_loss = tf.reduce_mean(tf.boolean_mask(losses, loss_mask))
 
-        mask = 1. - tf.dtypes.cast(tf.math.equal(y_true, 0), 'float32')
-
-        return tf.reduce_mean(losses)
+        return mean_loss 
 
 
 # # Optimizer
@@ -408,4 +408,39 @@ def TransformerOptimizer(d_model):
 
     return tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, 
                                      epsilon=1e-9)
+
+
+class Transformer():
+
+    def __init(self, num_classes, max_seq_len, d_model = 512, num_layers = 6, num_heads = 8, dropout = 0.1, dff = 2048):
+
+        self.model = TransformerModel(num_classes, max_seq_len, d_model, num_layers, num_heads, dropout, dff)
+
+        self.loss = TransformerLoss()
+
+        self.opt = TransformerOptimizer(d_model)
+
+
+    def train_step(X,Y):
+
+        decoder_input = Y[:,:-1] # don't include end token pushed into decoder
+        decoder_target = Y[:,1:] # don't include start token in decoder output label
+
+        with tf.GradientTape() as tape:
+
+            predictions = self.model((X,decoder_input), True)
+
+            losses = self.loss(predictions, decoder_target)
+
+        gradients = tape.gradient(loss, self.model.trainable_variables)    
+        self.opt.apply_gradients(zip(gradients, self.transformer.trainable_variables))
+
+        return losses
+
+    def train(data, validation_split = 0.1):
+
+         
+
+
+        
 
