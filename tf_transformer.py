@@ -4,6 +4,7 @@
 import tensorflow as tf
 import numpy as np
 import tensorflow_probability as tfp
+import math
 
 # # Scaled Dot-Product attention function
 
@@ -374,9 +375,9 @@ class TransformerLoss():
         self.loss_obj = tf.keras.losses.SparseCategoricalCrossentropy(
                         from_logits=True, reduction='none')
 
-    def __call__(self, labels, logits):
+    def __call__(self, labels, logits, loss_mask):
 
-        losses = self.loss_object(labels, logits)
+        losses = self.loss_obj(labels, logits)
 
         mean_loss = tf.reduce_mean(tf.boolean_mask(losses, loss_mask))
 
@@ -421,26 +422,80 @@ class Transformer():
         self.opt = TransformerOptimizer(d_model)
 
 
-    def train_step(X,Y):
+    def train_step(self, X,Y):
 
         decoder_input = Y[:,:-1] # don't include end token pushed into decoder
         decoder_target = Y[:,1:] # don't include start token in decoder output label
 
         with tf.GradientTape() as tape:
 
-            predictions = self.model((X,decoder_input), True)
+            predictions, mask = self.model((X,decoder_input), True)
 
-            losses = self.loss(predictions, decoder_target)
+            loss = self.loss(predictions, decoder_target, mask)
 
         gradients = tape.gradient(loss, self.model.trainable_variables)    
-        self.opt.apply_gradients(zip(gradients, self.transformer.trainable_variables))
+        self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
 
-        return losses
+        return loss
 
-    def train(data, validation_split = 0.1):
+    def train_in_batches(self, X, Y, batch_size, exp_loss_beta = 0.9, EMA = True):
 
-         
-
-
+        m = X.shape[0]
         
+        num_batches = math.ceil(m / batch_size)
 
+        losses = []
+
+        epoch_loss = 0
+        
+        for (batch_num, step) in enumerate(range(0, m, batch_size)):
+
+                batch_x = X[step : min(step + batch_size, m)]
+                batch_y = Y[step : min(step + batch_size, m)]
+
+                batch_loss = self.train_step(batch_x, batch_y)
+
+                if EMA:
+                    epoch_loss = (exp_loss_beta * epoch_loss + (1 - exp_loss_beta) * batch_loss)/(1 - exp_loss_beta**(batch_num + 1))
+                    print('\tBatch ', batch_num + 1, '/', num_batches, ', Loss: ', epoch_loss, end = '\r')
+                
+                losses.append(batch_loss)
+
+        return np.mean(losses)
+
+
+    def train(self, X, Y, epochs = 100, batch_size = 32, validation_split = 0.1):
+
+        if validation_split > 0:
+            m = X.shape[0]
+            validation_m = math.floor(validation_split * m)
+            m -= validation_m
+
+            trainX, trainY, validationX, validationY = X[:m], Y[:m], X[m:], Y[m:]
+        else:
+            trainX, trainY = X,Y
+
+        epoch_losses = []
+
+        try:
+
+            for epoch in range(epochs):
+
+                print('-- EPOCH ', epoch + 1, ' --')
+
+                epoch_loss = self.train_in_batches(trainX, trainY, batch_size, exp_loss_beta = 0.9, EMA = True)
+
+                print('\tEpoch ', epoch + 1, ' Loss: ', epoch_loss)
+
+                if validation_split > 0:
+
+                    validation_loss = self.train_in_batches(validationX, validationY, batch_size, EMA = False)
+
+                    print('\tValidation Loss: ', validation_loss)
+                
+                epoch_losses.append(epoch_loss)
+
+        except KeyboardInterrupt:
+            pass
+
+        return epoch_losses
